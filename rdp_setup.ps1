@@ -38,15 +38,30 @@ if ($PSVersionTable.PSEdition -eq 'Core' -or -not $isAdmin) {
     $relaunchCode = 1
     $scriptFile   = $PSCommandPath
     if ($RdpSetupFromIex) {
-        # Save our own source text to a file so the new process can run it.
-        try {
-            $src = $MyInvocation.MyCommand.ScriptBlock.ToString()
-            if ($src -notmatch 'RdpSetupFromIex') { throw 'script text unavailable' }
-            $scriptFile = Join-Path $env:TEMP 'rdp_setup.ps1'
-            [IO.File]::WriteAllText($scriptFile, $src, [Text.UTF8Encoding]::new($true))
-        } catch {
-            $scriptFile = $null
-            Write-Host "Could not save the script for re-launch ($($_.Exception.Message))." -ForegroundColor Red
+        # No file to re-launch, and under iex $MyInvocation describes the caller's
+        # command line, not this script. Download the script again: use the URL from
+        # the caller's "irm <url> | iex" line if there is one, else the default.
+        $defaultUrl = 'https://raw.githubusercontent.com/hive-admin/public-scripts/refs/heads/main/rdp_setup.ps1'
+        $callerText = ''
+        try { $callerText = "$($MyInvocation.Line) $($MyInvocation.MyCommand.ScriptBlock)" } catch { }
+        $urls = @([regex]::Matches($callerText, 'https?://[^\s''"|;)]+') | ForEach-Object { $_.Value }) + $defaultUrl |
+                Select-Object -Unique
+        $scriptFile = $null
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        foreach ($u in $urls) {
+            try {
+                $src = (Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 60).Content
+                if ($src -is [byte[]]) { $src = [Text.Encoding]::UTF8.GetString($src) }
+                if ($src -notmatch 'RdpSetupFromIex') { throw 'not this setup script' }
+                $scriptFile = Join-Path $env:TEMP 'rdp_setup.ps1'
+                [IO.File]::WriteAllText($scriptFile, $src, [Text.UTF8Encoding]::new($true))
+                break
+            } catch {
+                Write-Host "  Could not fetch $u ($($_.Exception.Message))" -ForegroundColor DarkGray
+            }
+        }
+        if (-not $scriptFile) {
+            Write-Host 'Could not get a copy of the script to re-launch.' -ForegroundColor Red
             Write-Host 'Run it from an elevated Windows PowerShell 5.1 window, or save it to a .ps1 file.' -ForegroundColor Red
         }
     }

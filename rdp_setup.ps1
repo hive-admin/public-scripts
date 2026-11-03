@@ -1,5 +1,5 @@
 # ============================================================
-# setup-script-min.ps1 -- Windows Server 2022 bootstrap
+# rdp_setup.ps1 -- Windows Server 2022 bootstrap
 #
 # Installs: Chocolatey, winget, Scoop, Windows Terminal,
 #           Google Chrome, aria2, MongoDB (Server, Shell,
@@ -8,7 +8,8 @@
 #
 # Usage (self-elevates and re-launches under Windows PowerShell 5.1):
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
-#   .\setup-script-min.ps1
+#   .\rdp_setup.ps1
+#   or: irm <raw-url>/rdp_setup.ps1 | iex
 #
 # Safe to re-run: every step detects existing installs first.
 # Exit code: 0 = no failures, 1 = one or more steps failed.
@@ -20,6 +21,12 @@ param(
     [string]$LogPath = "$env:SystemDrive\Logs\ServerSetup"
 )
 
+# Run via "irm <url> | iex": there is no script file, and 'exit' would close
+# the caller's console. In that mode every exit point uses 'return' instead
+# and the caller's StrictMode / ErrorActionPreference are restored at the end.
+$RdpSetupFromIex = -not $PSCommandPath
+$RdpSetupOrigEAP = $ErrorActionPreference
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
@@ -28,18 +35,41 @@ $ProgressPreference    = 'SilentlyContinue'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin  = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($PSVersionTable.PSEdition -eq 'Core' -or -not $isAdmin) {
-    if (-not $PSCommandPath) { Write-Host 'Save this script to a .ps1 file and run it from there.' -ForegroundColor Red; exit 1 }
-    $relaunch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-    if ($SkipRebootCheck) { $relaunch += '-SkipRebootCheck' }
-    $relaunch += @('-LogPath', "`"$($LogPath.TrimEnd('\'))`"")
-    $winPS = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    if ($isAdmin) {
-        $child = Start-Process $winPS -ArgumentList $relaunch -NoNewWindow -Wait -PassThru
-        exit $child.ExitCode
+    $relaunchCode = 1
+    $scriptFile   = $PSCommandPath
+    if ($RdpSetupFromIex) {
+        # Save our own source text to a file so the new process can run it.
+        try {
+            $src = $MyInvocation.MyCommand.ScriptBlock.ToString()
+            if ($src -notmatch 'RdpSetupFromIex') { throw 'script text unavailable' }
+            $scriptFile = Join-Path $env:TEMP 'rdp_setup.ps1'
+            [IO.File]::WriteAllText($scriptFile, $src, [Text.UTF8Encoding]::new($true))
+        } catch {
+            $scriptFile = $null
+            Write-Host "Could not save the script for re-launch ($($_.Exception.Message))." -ForegroundColor Red
+            Write-Host 'Run it from an elevated Windows PowerShell 5.1 window, or save it to a .ps1 file.' -ForegroundColor Red
+        }
     }
-    Write-Host 'Not elevated -- continuing in a new Administrator window...' -ForegroundColor Yellow
-    Start-Process $winPS -ArgumentList (@('-NoExit') + $relaunch) -Verb RunAs | Out-Null
-    exit 0
+    if ($scriptFile) {
+        $relaunch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptFile`"")
+        if ($SkipRebootCheck) { $relaunch += '-SkipRebootCheck' }
+        $relaunch += @('-LogPath', "`"$($LogPath.TrimEnd('\'))`"")
+        $winPS = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        if ($isAdmin) {
+            $child = Start-Process $winPS -ArgumentList $relaunch -NoNewWindow -Wait -PassThru
+            $relaunchCode = $child.ExitCode
+        } else {
+            Write-Host 'Not elevated -- continuing in a new Administrator window...' -ForegroundColor Yellow
+            Start-Process $winPS -ArgumentList (@('-NoExit') + $relaunch) -Verb RunAs | Out-Null
+            $relaunchCode = 0
+        }
+    }
+    if ($RdpSetupFromIex) {
+        Set-StrictMode -Off; $ErrorActionPreference = $RdpSetupOrigEAP
+        $global:LASTEXITCODE = $relaunchCode
+        return
+    }
+    exit $relaunchCode
 }
 
 # ============================================================
@@ -1214,7 +1244,12 @@ $script:SectionCount = $sections.Count + 1   # + Pre-flight
 $mutex = New-Object System.Threading.Mutex($false, 'Global\RdpSetupScript')
 $haveLock = $false
 try { $haveLock = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
-if (-not $haveLock) { Write-Host 'Another instance of this setup script is already running.' -ForegroundColor Red; exit 1 }
+if (-not $haveLock) {
+    Write-Host 'Another instance of this setup script is already running.' -ForegroundColor Red
+    $mutex.Dispose()
+    if ($RdpSetupFromIex) { Set-StrictMode -Off; $ErrorActionPreference = $RdpSetupOrigEAP; $global:LASTEXITCODE = 1; return }
+    exit 1
+}
 
 $exitCode = 1
 try {
@@ -1222,7 +1257,8 @@ try {
     $script:LogFile = Join-Path $LogPath ('setup_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
     $script:WorkDir = Join-Path $env:TEMP ('rdp-setup-{0:yyyyMMddHHmmss}' -f (Get-Date))
     New-Item -ItemType Directory -Path $script:WorkDir -Force | Out-Null
-    Write-Log "START $($MyInvocation.MyCommand.Path) as $($identity.Name) on $env:COMPUTERNAME"
+    $source = if ($PSCommandPath) { $PSCommandPath } else { 'irm | iex' }
+    Write-Log "START $source as $($identity.Name) on $env:COMPUTERNAME"
 
     try { $Host.UI.RawUI.WindowTitle = 'Server setup' } catch { }
     Write-Host ''
@@ -1265,5 +1301,10 @@ try {
     }
     if ($haveLock) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
+}
+if ($RdpSetupFromIex) {
+    Set-StrictMode -Off; $ErrorActionPreference = $RdpSetupOrigEAP
+    $global:LASTEXITCODE = $exitCode
+    return
 }
 exit $exitCode
